@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "node:http";
-import { timingSafeEqual } from "node:crypto";
+import { createHash, timingSafeEqual } from "node:crypto";
 import { PelicanClient } from "./client.ts";
 import { registerServerTools } from "./tools/servers.ts";
 import { registerFileTools } from "./tools/files.ts";
@@ -43,10 +43,14 @@ if (port) {
     console.error("Error: MCP_AUTH_TOKEN must be set in HTTP mode.");
     process.exit(1);
   }
-  const expected = Buffer.from(`Bearer ${token}`);
+  const sha = (v: string) => createHash("sha256").update(v).digest();
+  const expectedHash = sha(token);
+  const isValid = (candidate: string | null | undefined): boolean =>
+    !!candidate && timingSafeEqual(sha(candidate), expectedHash);
 
   const httpServer = createServer(async (req, res) => {
-    const path = (req.url ?? "").split("?")[0];
+    const parsed = new URL(req.url ?? "/", "http://localhost");
+    const path = parsed.pathname;
     if (path === "/health") {
       res.writeHead(200).end("ok");
       return;
@@ -55,8 +59,10 @@ if (port) {
       res.writeHead(404).end("Not found");
       return;
     }
-    const got = Buffer.from(req.headers["authorization"] ?? "");
-    if (got.length !== expected.length || !timingSafeEqual(got, expected)) {
+    // Token accettato in 3 modi: header "Bearer <token>", header con solo "<token>", oppure ?token=<token>
+    const auth = (req.headers["authorization"] ?? "").trim();
+    const headerToken = auth.replace(/^Bearer\s+/i, "");
+    if (!isValid(headerToken) && !isValid(parsed.searchParams.get("token"))) {
       res.writeHead(401).end("Unauthorized");
       return;
     }
