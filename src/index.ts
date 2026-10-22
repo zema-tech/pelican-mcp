@@ -1,5 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+import { createServer } from "node:http";
+import { timingSafeEqual } from "node:crypto";
 import { PelicanClient } from "./client.ts";
 import { registerServerTools } from "./tools/servers.ts";
 import { registerFileTools } from "./tools/files.ts";
@@ -18,16 +21,72 @@ if (!url || !key) {
 }
 
 const client = new PelicanClient(url, key);
-const server = new McpServer({ name: "pelican-mcp", version: "1.0.0" });
 
-registerServerTools(server, client);
-registerFileTools(server, client);
-registerBackupTools(server, client);
-registerConsoleTools(server, client);
-registerAdminTools(server, client);
-registerDatabaseTools(server, client);
-registerPluginTools(server, client);
+function buildServer(): McpServer {
+  const server = new McpServer({ name: "pelican-mcp", version: "1.0.0" });
+  registerServerTools(server, client);
+  registerFileTools(server, client);
+  registerBackupTools(server, client);
+  registerConsoleTools(server, client);
+  registerAdminTools(server, client);
+  registerDatabaseTools(server, client);
+  registerPluginTools(server, client);
+  return server;
+}
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error("Pelican MCP server running on stdio");
+const port = process.env["PORT"];
+
+if (port) {
+  // Modalità HTTP (Render): endpoint MCP su /mcp, protetto da token
+  const token = process.env["MCP_AUTH_TOKEN"];
+  if (!token) {
+    console.error("Error: MCP_AUTH_TOKEN must be set in HTTP mode.");
+    process.exit(1);
+  }
+  const expected = Buffer.from(`Bearer ${token}`);
+
+  const httpServer = createServer(async (req, res) => {
+    const path = (req.url ?? "").split("?")[0];
+    if (path === "/health") {
+      res.writeHead(200).end("ok");
+      return;
+    }
+    if (path !== "/mcp") {
+      res.writeHead(404).end("Not found");
+      return;
+    }
+    const got = Buffer.from(req.headers["authorization"] ?? "");
+    if (got.length !== expected.length || !timingSafeEqual(got, expected)) {
+      res.writeHead(401).end("Unauthorized");
+      return;
+    }
+    if (req.method !== "POST") {
+      res.writeHead(405, { Allow: "POST" }).end("Method not allowed");
+      return;
+    }
+    const chunks: Buffer[] = [];
+    for await (const c of req) chunks.push(c as Buffer);
+    let body: unknown;
+    try {
+      body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    } catch {
+      res.writeHead(400).end("Invalid JSON");
+      return;
+    }
+    const server = buildServer();
+    const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+    res.on("close", () => {
+      transport.close();
+      server.close();
+    });
+    await server.connect(transport);
+    await transport.handleRequest(req, res, body);
+  });
+  httpServer.listen(Number(port), "0.0.0.0", () => {
+    console.error(`Pelican MCP server running on HTTP :${port}/mcp`);
+  });
+} else {
+  const server = buildServer();
+  await server.connect(new StdioServerTransport());
+  console.error("Pelican MCP server running on stdio");
+}
